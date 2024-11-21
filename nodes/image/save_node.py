@@ -2,6 +2,7 @@ import os
 import time
 import numpy as np
 from PIL import Image, ImageSequence, ImageOps
+import folder_paths
 
 #from load_node import load_image, pil2tensor
 
@@ -34,12 +35,26 @@ class SaveImageNode:
     OUTPUT_NODE = True
     
     def save_image(self, images, path, quality):
-        filepaht = path.split('\n')[0]
-        format = os.path.splitext(filepaht)[1][1:]
+        results = list()
+        filepath = path.split('\n')[0]
+        format = os.path.splitext(filepath)[1][1:]
         image = images[0] 
         img = Image.fromarray((255. * image.cpu().numpy()).astype(np.uint8))
-        save_image(img, filepaht, format, quality)
-        return {}
+        file_name = os.path.basename(filepath)
+        file_location = os.path.dirname(filepath)
+        if file_location == "" or file_location == None:
+            file_location = folder_paths.get_output_directory()
+            filepath = os.path.join(file_location, file_name)
+        # if file_location doesn't exist, create it
+        if not os.path.exists(file_location):
+            os.makedirs(file_location)
+        save_image(img, filepath, format, quality)
+        results.append({
+                "filename": file_name,
+                "subfolder": file_location,
+                "type": format
+            })
+        return { "ui": { "images": results, "animated": (False,) }}
         
 class SaveImagesNode:
     @classmethod
@@ -59,12 +74,24 @@ class SaveImagesNode:
     OUTPUT_NODE = True
     
     def save_image(self, images, path, prefix, format, quality):
-        format = format.lower()            
+        results = list()
+        format = format.lower()
+        subfolder = path.split('\n')[0]
+        if path == "" or path == None:
+            path = folder_paths.get_output_directory()
         for i, image in enumerate(images):
             img = Image.fromarray((255. * image.cpu().numpy()).astype(np.uint8))
             filepath = self.generate_filename(path, prefix, i, format)
+            file_name = os.path.basename(filepath)
+            file_location = os.path.dirname(filepath)
             save_image(img, filepath, format, quality)
-        return {}
+            results.append({
+                "filename": file_name,
+                "subfolder": subfolder,
+                "type": format
+            })
+        animated = len(results) > 1
+        return { "ui": { "images": results, "animated": (animated,) }}
 
     def IS_CHANGED(s, images):
         return time.time()
