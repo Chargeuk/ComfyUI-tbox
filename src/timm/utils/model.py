@@ -3,10 +3,13 @@
 Hacked together by / Copyright 2020 Ross Wightman
 """
 import fnmatch
+from copy import deepcopy
 
 import torch
 from torchvision.ops.misc import FrozenBatchNorm2d
 
+from timm.layers import BatchNormAct2d, SyncBatchNormAct, FrozenBatchNormAct2d,\
+    freeze_batch_norm_2d, unfreeze_batch_norm_2d
 from .model_ema import ModelEma
 
 
@@ -14,7 +17,12 @@ def unwrap_model(model):
     if isinstance(model, ModelEma):
         return unwrap_model(model.ema)
     else:
-        return model.module if hasattr(model, 'module') else model
+        if hasattr(model, 'module'):
+            return unwrap_model(model.module)
+        elif hasattr(model, '_orig_mod'):
+            return unwrap_model(model._orig_mod)
+        else:
+            return model
 
 
 def get_state_dict(model, unwrap_fn=unwrap_model):
@@ -88,7 +96,7 @@ def extract_spp_stats(
         hook_fns,
         input_shape=[8, 3, 224, 224]):
     """Extract average square channel mean and variance of activations during 
-    forward pass to plot Signal Propogation Plots (SPP).
+        forward pass to plot Signal Propogation Plots (SPP).
     
     Paper: https://arxiv.org/abs/2101.08692
 
@@ -100,74 +108,11 @@ def extract_spp_stats(
     return hook.stats
 
 
-def freeze_batch_norm_2d(module):
-    """
-    Converts all `BatchNorm2d` and `SyncBatchNorm` layers of provided module into `FrozenBatchNorm2d`. If `module` is
-    itself an instance of either `BatchNorm2d` or `SyncBatchNorm`, it is converted into `FrozenBatchNorm2d` and
-    returned. Otherwise, the module is walked recursively and submodules are converted in place.
-
-    Args:
-        module (torch.nn.Module): Any PyTorch module.
-
-    Returns:
-        torch.nn.Module: Resulting module
-
-    Inspired by https://github.com/pytorch/pytorch/blob/a5895f85be0f10212791145bfedc0261d364f103/torch/nn/modules/batchnorm.py#L762
-    """
-    res = module
-    if isinstance(module, (torch.nn.modules.batchnorm.BatchNorm2d, torch.nn.modules.batchnorm.SyncBatchNorm)):
-        res = FrozenBatchNorm2d(module.num_features)
-        res.num_features = module.num_features
-        res.affine = module.affine
-        if module.affine:
-            res.weight.data = module.weight.data.clone().detach()
-            res.bias.data = module.bias.data.clone().detach()
-        res.running_mean.data = module.running_mean.data
-        res.running_var.data = module.running_var.data
-        res.eps = module.eps
-    else:
-        for name, child in module.named_children():
-            new_child = freeze_batch_norm_2d(child)
-            if new_child is not child:
-                res.add_module(name, new_child)
-    return res
-
-
-def unfreeze_batch_norm_2d(module):
-    """
-    Converts all `FrozenBatchNorm2d` layers of provided module into `BatchNorm2d`. If `module` is itself and instance
-    of `FrozenBatchNorm2d`, it is converted into `BatchNorm2d` and returned. Otherwise, the module is walked
-    recursively and submodules are converted in place.
-
-    Args:
-        module (torch.nn.Module): Any PyTorch module.
-
-    Returns:
-        torch.nn.Module: Resulting module
-
-    Inspired by https://github.com/pytorch/pytorch/blob/a5895f85be0f10212791145bfedc0261d364f103/torch/nn/modules/batchnorm.py#L762
-    """
-    res = module
-    if isinstance(module, FrozenBatchNorm2d):
-        res = torch.nn.BatchNorm2d(module.num_features)
-        if module.affine:
-            res.weight.data = module.weight.data.clone().detach()
-            res.bias.data = module.bias.data.clone().detach()
-        res.running_mean.data = module.running_mean.data
-        res.running_var.data = module.running_var.data
-        res.eps = module.eps
-    else:
-        for name, child in module.named_children():
-            new_child = unfreeze_batch_norm_2d(child)
-            if new_child is not child:
-                res.add_module(name, new_child)
-    return res
-
-
 def _freeze_unfreeze(root_module, submodules=[], include_bn_running_stats=True, mode='freeze'):
     """
     Freeze or unfreeze parameters of the specified modules and those of all their hierarchical descendants. This is
-    done in place.
+        done in place.
+
     Args:
         root_module (nn.Module, optional): Root module relative to which the `submodules` are referenced.
         submodules (list[str]): List of modules for which the parameters will be (un)frozen. They are to be provided as
@@ -179,7 +124,12 @@ def _freeze_unfreeze(root_module, submodules=[], include_bn_running_stats=True, 
     """
     assert mode in ["freeze", "unfreeze"], '`mode` must be one of "freeze" or "unfreeze"'
 
-    if isinstance(root_module, (torch.nn.modules.batchnorm.BatchNorm2d, torch.nn.modules.batchnorm.SyncBatchNorm)):
+    if isinstance(root_module, (
+            torch.nn.modules.batchnorm.BatchNorm2d,
+            torch.nn.modules.batchnorm.SyncBatchNorm,
+            BatchNormAct2d,
+            SyncBatchNormAct,
+    )):
         # Raise assertion here because we can't convert it in place
         raise AssertionError(
             "You have provided a batch norm layer as the `root module`. Please use "
@@ -213,19 +163,25 @@ def _freeze_unfreeze(root_module, submodules=[], include_bn_running_stats=True, 
                 # It's possible that `m` is a type of BatchNorm in itself, in which case `unfreeze_batch_norm_2d` won't
                 # convert it in place, but will return the converted result. In this case `res` holds the converted
                 # result and we may try to re-assign the named module
-                if isinstance(m, (torch.nn.modules.batchnorm.BatchNorm2d, torch.nn.modules.batchnorm.SyncBatchNorm)):
+                if isinstance(m, (
+                        torch.nn.modules.batchnorm.BatchNorm2d,
+                        torch.nn.modules.batchnorm.SyncBatchNorm,
+                        BatchNormAct2d,
+                        SyncBatchNormAct,
+                )):
                     _add_submodule(root_module, n, res)
             # Unfreeze batch norm
             else:
                 res = unfreeze_batch_norm_2d(m)
                 # Ditto. See note above in mode == 'freeze' branch
-                if isinstance(m, FrozenBatchNorm2d):
+                if isinstance(m, (FrozenBatchNorm2d, FrozenBatchNormAct2d)):
                     _add_submodule(root_module, n, res)
 
 
 def freeze(root_module, submodules=[], include_bn_running_stats=True):
     """
     Freeze parameters of the specified modules and those of all their hierarchical descendants. This is done in place.
+
     Args:
         root_module (nn.Module): Root module relative to which `submodules` are referenced.
         submodules (list[str]): List of modules for which the parameters will be frozen. They are to be provided as
@@ -260,6 +216,7 @@ def freeze(root_module, submodules=[], include_bn_running_stats=True):
 def unfreeze(root_module, submodules=[], include_bn_running_stats=True):
     """
     Unfreeze parameters of the specified modules and those of all their hierarchical descendants. This is done in place.
+
     Args:
         root_module (nn.Module): Root module relative to which `submodules` are referenced.
         submodules (list[str]): List of submodules for which the parameters will be (un)frozen. They are to be provided
@@ -271,3 +228,21 @@ def unfreeze(root_module, submodules=[], include_bn_running_stats=True):
     See example in docstring for `freeze`.
     """
     _freeze_unfreeze(root_module, submodules, include_bn_running_stats=include_bn_running_stats, mode="unfreeze")
+
+
+def reparameterize_model(model: torch.nn.Module, inplace=False) -> torch.nn.Module:
+    if not inplace:
+        model = deepcopy(model)
+
+    def _fuse(m):
+        for child_name, child in m.named_children():
+            if hasattr(child, 'fuse'):
+                setattr(m, child_name, child.fuse())
+            elif hasattr(child, "reparameterize"):
+                child.reparameterize()
+            elif hasattr(child, "switch_to_deploy"):
+                child.switch_to_deploy()
+            _fuse(child)
+
+    _fuse(model)
+    return model

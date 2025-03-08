@@ -12,39 +12,20 @@ Based on Apache 2.0 licensed code at https://github.com/snap-research/EfficientF
 
 Modifications and timm support by / Copyright 2022, Ross Wightman
 """
-from typing import Dict
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from .helpers import build_model_with_cfg
-from .layers import DropPath, trunc_normal_, to_2tuple, Mlp
-from .registry import register_model
+from timm.layers import DropPath, trunc_normal_, to_2tuple, Mlp, ndgrid
+from ._builder import build_model_with_cfg
+from ._features import feature_take_indices
+from ._manipulate import checkpoint_seq
+from ._registry import generate_default_cfgs, register_model
 
+__all__ = ['EfficientFormer']  # model_registry will add each entrypoint fn to this
 
-def _cfg(url='', **kwargs):
-    return {
-        'url': url,
-        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None, 'fixed_input_size': True,
-        'crop_pct': .95, 'interpolation': 'bicubic',
-        'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
-        'first_conv': 'stem.conv1', 'classifier': ('head', 'head_dist'),
-        **kwargs
-    }
-
-
-default_cfgs = dict(
-    efficientformer_l1=_cfg(
-        url="https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-morevit/efficientformer_l1_1000d_224-5b08fab0.pth",
-    ),
-    efficientformer_l3=_cfg(
-        url="https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-morevit/efficientformer_l3_300d_224-6816624f.pth",
-    ),
-    efficientformer_l7=_cfg(
-        url="https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-weights-morevit/efficientformer_l7_300d_224-e957ab75.pth",
-    ),
-)
 
 EfficientFormer_width = {
     'l1': (48, 96, 224, 448),
@@ -83,11 +64,11 @@ class Attention(torch.nn.Module):
         self.proj = nn.Linear(self.val_attn_dim, dim)
 
         resolution = to_2tuple(resolution)
-        pos = torch.stack(torch.meshgrid(torch.arange(resolution[0]), torch.arange(resolution[1]))).flatten(1)
+        pos = torch.stack(ndgrid(torch.arange(resolution[0]), torch.arange(resolution[1]))).flatten(1)
         rel_pos = (pos[..., :, None] - pos[..., None, :]).abs()
         rel_pos = (rel_pos[0] * resolution[1]) + rel_pos[1]
         self.attention_biases = torch.nn.Parameter(torch.zeros(num_heads, resolution[0] * resolution[1]))
-        self.register_buffer('attention_bias_idxs', torch.LongTensor(rel_pos))
+        self.register_buffer('attention_bias_idxs', rel_pos)
         self.attention_bias_cache = {}  # per-device attention_biases cache (data-parallel compat)
 
     @torch.no_grad()
@@ -97,7 +78,7 @@ class Attention(torch.nn.Module):
             self.attention_bias_cache = {}  # clear ab cache
 
     def get_attention_biases(self, device: torch.device) -> torch.Tensor:
-        if self.training:
+        if torch.jit.is_tracing() or self.training:
             return self.attention_biases[:, self.attention_bias_idxs]
         else:
             device_key = str(device)
@@ -231,7 +212,7 @@ class MetaBlock1d(nn.Module):
             mlp_ratio=4.,
             act_layer=nn.GELU,
             norm_layer=nn.LayerNorm,
-            drop=0.,
+            proj_drop=0.,
             drop_path=0.,
             layer_scale_init_value=1e-5
     ):
@@ -239,7 +220,12 @@ class MetaBlock1d(nn.Module):
         self.norm1 = norm_layer(dim)
         self.token_mixer = Attention(dim)
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+        self.mlp = Mlp(
+            in_features=dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            drop=proj_drop,
+        )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.ls1 = LayerScale(dim, layer_scale_init_value)
@@ -271,22 +257,28 @@ class MetaBlock2d(nn.Module):
             mlp_ratio=4.,
             act_layer=nn.GELU,
             norm_layer=nn.BatchNorm2d,
-            drop=0.,
+            proj_drop=0.,
             drop_path=0.,
             layer_scale_init_value=1e-5
     ):
         super().__init__()
         self.token_mixer = Pooling(pool_size=pool_size)
-        self.mlp = ConvMlpWithNorm(
-            dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, norm_layer=norm_layer, drop=drop)
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.ls1 = LayerScale2d(dim, layer_scale_init_value)
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.mlp = ConvMlpWithNorm(
+            dim,
+            hidden_features=int(dim * mlp_ratio),
+            act_layer=act_layer,
+            norm_layer=norm_layer,
+            drop=proj_drop,
+        )
         self.ls2 = LayerScale2d(dim, layer_scale_init_value)
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
-        x = x + self.drop_path(self.ls1(self.token_mixer(x)))
-        x = x + self.drop_path(self.ls2(self.mlp(x)))
+        x = x + self.drop_path1(self.ls1(self.token_mixer(x)))
+        x = x + self.drop_path2(self.ls2(self.mlp(x)))
         return x
 
 
@@ -304,7 +296,7 @@ class EfficientFormerStage(nn.Module):
             act_layer=nn.GELU,
             norm_layer=nn.BatchNorm2d,
             norm_layer_cl=nn.LayerNorm,
-            drop=.0,
+            proj_drop=.0,
             drop_path=0.,
             layer_scale_init_value=1e-5,
 ):
@@ -331,7 +323,7 @@ class EfficientFormerStage(nn.Module):
                         mlp_ratio=mlp_ratio,
                         act_layer=act_layer,
                         norm_layer=norm_layer_cl,
-                        drop=drop,
+                        proj_drop=proj_drop,
                         drop_path=drop_path[block_idx],
                         layer_scale_init_value=layer_scale_init_value,
                     ))
@@ -343,7 +335,7 @@ class EfficientFormerStage(nn.Module):
                         mlp_ratio=mlp_ratio,
                         act_layer=act_layer,
                         norm_layer=norm_layer,
-                        drop=drop,
+                        proj_drop=proj_drop,
                         drop_path=drop_path[block_idx],
                         layer_scale_init_value=layer_scale_init_value,
                     ))
@@ -354,7 +346,10 @@ class EfficientFormerStage(nn.Module):
 
     def forward(self, x):
         x = self.downsample(x)
-        x = self.blocks(x)
+        if self.grad_checkpointing and not torch.jit.is_scripting():
+            x = checkpoint_seq(self.blocks, x)
+        else:
+            x = self.blocks(x)
         return x
 
 
@@ -376,6 +371,7 @@ class EfficientFormer(nn.Module):
             norm_layer=nn.BatchNorm2d,
             norm_layer_cl=nn.LayerNorm,
             drop_rate=0.,
+            proj_drop_rate=0.,
             drop_path_rate=0.,
             **kwargs
     ):
@@ -387,33 +383,37 @@ class EfficientFormer(nn.Module):
         prev_dim = embed_dims[0]
 
         # stochastic depth decay rule
+        self.num_stages = len(depths)
+        last_stage = self.num_stages - 1
         dpr = [x.tolist() for x in torch.linspace(0, drop_path_rate, sum(depths)).split(depths)]
-        downsamples = downsamples or (False,) + (True,) * (len(depths) - 1)
+        downsamples = downsamples or (False,) + (True,) * (self.num_stages - 1)
         stages = []
-        for i in range(len(depths)):
+        self.feature_info = []
+        for i in range(self.num_stages):
             stage = EfficientFormerStage(
                 prev_dim,
                 embed_dims[i],
                 depths[i],
                 downsample=downsamples[i],
-                num_vit=num_vit if i == 3 else 0,
+                num_vit=num_vit if i == last_stage else 0,
                 pool_size=pool_size,
                 mlp_ratio=mlp_ratios,
                 act_layer=act_layer,
                 norm_layer_cl=norm_layer_cl,
                 norm_layer=norm_layer,
-                drop=drop_rate,
+                proj_drop=proj_drop_rate,
                 drop_path=dpr[i],
                 layer_scale_init_value=layer_scale_init_value,
             )
             prev_dim = embed_dims[i]
             stages.append(stage)
-
+            self.feature_info += [dict(num_chs=embed_dims[i], reduction=2**(i+2), module=f'stages.{i}')]
         self.stages = nn.Sequential(*stages)
 
         # Classifier head
-        self.num_features = embed_dims[-1]
+        self.num_features = self.head_hidden_size = embed_dims[-1]
         self.norm = norm_layer_cl(self.num_features)
+        self.head_drop = nn.Dropout(drop_rate)
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
         # assuming model is always distilled (valid for current checkpoints, will split def if that changes)
         self.head_dist = nn.Linear(embed_dims[-1], num_classes) if num_classes > 0 else nn.Identity()
@@ -446,10 +446,10 @@ class EfficientFormer(nn.Module):
             s.grad_checkpointing = enable
 
     @torch.jit.ignore
-    def get_classifier(self):
+    def get_classifier(self) -> nn.Module:
         return self.head, self.head_dist
 
-    def reset_classifier(self, num_classes, global_pool=None):
+    def reset_classifier(self, num_classes: int, global_pool: Optional[str] = None):
         self.num_classes = num_classes
         if global_pool is not None:
             self.global_pool = global_pool
@@ -460,6 +460,76 @@ class EfficientFormer(nn.Module):
     def set_distilled_training(self, enable=True):
         self.distilled_training = enable
 
+    def forward_intermediates(
+            self,
+            x: torch.Tensor,
+            indices: Optional[Union[int, List[int]]] = None,
+            norm: bool = False,
+            stop_early: bool = False,
+            output_fmt: str = 'NCHW',
+            intermediates_only: bool = False,
+    ) -> Union[List[torch.Tensor], Tuple[torch.Tensor, List[torch.Tensor]]]:
+        """ Forward features that returns intermediates.
+
+        Args:
+            x: Input image tensor
+            indices: Take last n blocks if int, all if None, select matching indices if sequence
+            norm: Apply norm layer to compatible intermediates
+            stop_early: Stop iterating over blocks when last desired intermediate hit
+            output_fmt: Shape of intermediate feature outputs
+            intermediates_only: Only return intermediate features
+        Returns:
+
+        """
+        assert output_fmt in ('NCHW',), 'Output shape must be NCHW.'
+        intermediates = []
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+
+        # forward pass
+        x = self.stem(x)
+        B, C, H, W = x.shape
+
+        last_idx = self.num_stages - 1
+        if torch.jit.is_scripting() or not stop_early:  # can't slice blocks in torchscript
+            stages = self.stages
+        else:
+            stages = self.stages[:max_index + 1]
+        feat_idx = 0
+        for feat_idx, stage in enumerate(stages):
+            x = stage(x)
+            if feat_idx < last_idx:
+                B, C, H, W = x.shape
+            if feat_idx in take_indices:
+                if feat_idx == last_idx:
+                    x_inter = self.norm(x) if norm else x
+                    intermediates.append(x_inter.reshape(B, H // 2, W // 2, -1).permute(0, 3, 1, 2))
+                else:
+                    intermediates.append(x)
+
+        if intermediates_only:
+            return intermediates
+
+        if feat_idx == last_idx:
+            x = self.norm(x)
+
+        return x, intermediates
+
+    def prune_intermediate_layers(
+            self,
+            indices: Union[int, List[int]] = 1,
+            prune_norm: bool = False,
+            prune_head: bool = True,
+    ):
+        """ Prune layers not required for specified intermediates.
+        """
+        take_indices, max_index = feature_take_indices(len(self.stages), indices)
+        self.stages = self.stages[:max_index + 1]  # truncate blocks w/ stem as idx 0
+        if prune_norm:
+            self.norm = nn.Identity()
+        if prune_head:
+            self.reset_classifier(0, '')
+        return take_indices
+
     def forward_features(self, x):
         x = self.stem(x)
         x = self.stages(x)
@@ -469,6 +539,7 @@ class EfficientFormer(nn.Module):
     def forward_head(self, x, pre_logits: bool = False):
         if self.global_pool == 'avg':
             x = x.mean(dim=1)
+        x = self.head_drop(x)
         if pre_logits:
             return x
         x, x_dist = self.head(x), self.head_dist(x)
@@ -485,7 +556,7 @@ class EfficientFormer(nn.Module):
         return x
 
 
-def _checkpoint_filter_fn(state_dict, model):
+def checkpoint_filter_fn(state_dict, model):
     """ Remap original checkpoints -> timm """
     if 'stem.0.weight' in state_dict:
         return state_dict  # non-original checkpoint, no remapping needed
@@ -512,40 +583,67 @@ def _checkpoint_filter_fn(state_dict, model):
     return out_dict
 
 
+def _cfg(url='', **kwargs):
+    return {
+        'url': url,
+        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None, 'fixed_input_size': True,
+        'crop_pct': .95, 'interpolation': 'bicubic',
+        'mean': IMAGENET_DEFAULT_MEAN, 'std': IMAGENET_DEFAULT_STD,
+        'first_conv': 'stem.conv1', 'classifier': ('head', 'head_dist'),
+        **kwargs
+    }
+
+
+default_cfgs = generate_default_cfgs({
+    'efficientformer_l1.snap_dist_in1k': _cfg(
+        hf_hub_id='timm/',
+    ),
+    'efficientformer_l3.snap_dist_in1k': _cfg(
+        hf_hub_id='timm/',
+    ),
+    'efficientformer_l7.snap_dist_in1k': _cfg(
+        hf_hub_id='timm/',
+    ),
+})
+
+
 def _create_efficientformer(variant, pretrained=False, **kwargs):
+    out_indices = kwargs.pop('out_indices', 4)
     model = build_model_with_cfg(
         EfficientFormer, variant, pretrained,
-        pretrained_filter_fn=_checkpoint_filter_fn,
-        **kwargs)
+        pretrained_filter_fn=checkpoint_filter_fn,
+        feature_cfg=dict(out_indices=out_indices, feature_cls='getter'),
+        **kwargs,
+    )
     return model
 
 
 @register_model
-def efficientformer_l1(pretrained=False, **kwargs):
-    model_kwargs = dict(
+def efficientformer_l1(pretrained=False, **kwargs) -> EfficientFormer:
+    model_args = dict(
         depths=EfficientFormer_depth['l1'],
         embed_dims=EfficientFormer_width['l1'],
         num_vit=1,
-        **kwargs)
-    return _create_efficientformer('efficientformer_l1', pretrained=pretrained, **model_kwargs)
+    )
+    return _create_efficientformer('efficientformer_l1', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def efficientformer_l3(pretrained=False, **kwargs):
-    model_kwargs = dict(
+def efficientformer_l3(pretrained=False, **kwargs) -> EfficientFormer:
+    model_args = dict(
         depths=EfficientFormer_depth['l3'],
         embed_dims=EfficientFormer_width['l3'],
         num_vit=4,
-        **kwargs)
-    return _create_efficientformer('efficientformer_l3', pretrained=pretrained, **model_kwargs)
+    )
+    return _create_efficientformer('efficientformer_l3', pretrained=pretrained, **dict(model_args, **kwargs))
 
 
 @register_model
-def efficientformer_l7(pretrained=False, **kwargs):
-    model_kwargs = dict(
+def efficientformer_l7(pretrained=False, **kwargs) -> EfficientFormer:
+    model_args = dict(
         depths=EfficientFormer_depth['l7'],
         embed_dims=EfficientFormer_width['l7'],
         num_vit=8,
-        **kwargs)
-    return _create_efficientformer('efficientformer_l7', pretrained=pretrained, **model_kwargs)
+    )
+    return _create_efficientformer('efficientformer_l7', pretrained=pretrained, **dict(model_args, **kwargs))
 
